@@ -95,3 +95,162 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import pandas as pd
+from pathlib import Path
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import make_pipeline as sk_make_pipeline
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV
+from sklearn.feature_selection import SelectKBest
+
+def read_data(file):
+    dir = Path("files/input")
+    return pd.read_csv(dir / file, compression="zip")
+
+def clean_data(df: pd.DataFrame):
+    df = df.copy()
+    df = df.rename(columns={"default payment next month": "default"})
+    df = df.drop(columns="ID")
+    df = df.dropna()
+    df = df[df["MARRIAGE"] != 0]
+    df = df[df["EDUCATION"] != 0]
+
+    def education(e):
+        if e > 4:
+            return 4
+        return e
+    df["EDUCATION"] = df["EDUCATION"].map(education)
+    df = df.dropna()
+    return df
+
+
+def make_xy(df: pd.DataFrame):
+    x = df[df.columns].copy()
+    x.drop(columns="default", inplace=True)
+    y = df["default"].copy()
+    return x, y
+
+
+def make_train_test_split(df: pd.DataFrame):
+    from sklearn.model_selection import train_test_split
+
+    x, y = make_xy(df)
+
+    (x_train, x_test, y_train, y_test) = train_test_split(
+        x,
+        y,
+        random_state=0,
+    )
+    return x_train, x_test, y_train, y_test
+
+
+def make_pipeline():
+    return sk_make_pipeline(
+        ColumnTransformer(
+            transformers=[("encoder", OneHotEncoder(handle_unknown="ignore"), ['SEX', 'EDUCATION', 'MARRIAGE'])],
+            remainder=MinMaxScaler()
+        ),
+        SelectKBest(),
+        LogisticRegression(penalty="l2")
+    )
+
+def make_grid_search(estimator, param_grid, cv=10):
+    return GridSearchCV(
+        estimator=estimator,
+        param_grid=param_grid,
+        cv=cv,
+        scoring="balanced_accuracy",
+        n_jobs=-1
+    )
+
+def save_estimator(estimator):
+    import pickle
+    import gzip
+    from pathlib import Path
+
+    outdir = Path("files/models")
+    outdir.mkdir(exist_ok=True)
+
+    with gzip.open(outdir / "model.pkl.gz", "wb") as file:
+        pickle.dump(estimator, file)
+
+def save_metrics(metrics):
+    import json
+    from pathlib import Path
+
+    outdir = Path("files/output")
+    outdir.mkdir(exist_ok=True)
+
+    strmetrics = []
+    for metric in metrics:
+        strmetrics.append(json.dumps(metric)+"\n")
+
+    with open(outdir / "metrics.json", "w") as file:
+        file.writelines(strmetrics)
+
+def train_estimator(x_train, y_train):
+    pipeline = make_pipeline()
+    estimator = make_grid_search(pipeline, param_grid={
+        "selectkbest__k": range(1, 11),
+        "logisticregression__C": [0.001, 0.01, 0.1, 1, 10, 100],
+    })
+
+    estimator.fit(x_train, y_train)
+    save_estimator(estimator)
+    return estimator
+
+def eval_metrics(y_true, y_pred):
+    from sklearn.metrics import precision_score, balanced_accuracy_score, recall_score, f1_score
+
+    acc = precision_score(y_true, y_pred)
+    bacc = balanced_accuracy_score(y_true, y_pred)
+    recall = recall_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred)
+
+    return acc, bacc, recall, f1
+
+def eval_confusion(dataset, y_true, y_pred):
+    from sklearn.metrics import confusion_matrix
+    m = confusion_matrix(y_true, y_pred)
+    return {
+        "type": "cm_matrix",
+        "dataset": dataset,
+        "true_0": {
+            "predicted_0": int(m[0][0]),
+            "predicted_1": int(m[0][1])
+        },
+        "true_1": {
+            "predicted_0": int(m[1][0]),
+            "predicted_1": int(m[1][1])
+        }
+    }
+
+def main():
+    x_train, y_train = make_xy(clean_data(read_data("train_data.csv.zip")))
+    x_test, y_test = make_xy(clean_data(read_data("test_data.csv.zip")))
+
+    estimator = train_estimator(x_train, y_train)
+
+    metrics = []
+    for dataset, x, y in [("train", x_train, y_train), ("test", x_test, y_test)]:
+        y_pred = estimator.predict(x)
+        acc, bacc, recall, f1 = eval_metrics(y, y_pred)
+        metrics.append({
+            "type": "metrics",
+            "dataset": dataset,
+            "precision": acc,
+            "balanced_accuracy": bacc,
+            "recall": recall,
+            "f1_score": f1
+        })
+
+    cm_matrix = []
+    for dataset, x, y in [("train", x_train, y_train), ("test", x_test, y_test)]:
+        y_pred = estimator.predict(x)
+        cm_matrix.append(eval_confusion(dataset, y, y_pred))
+
+    save_metrics([*metrics, *cm_matrix])
+
+main()
